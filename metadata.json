@@ -1,0 +1,6 @@
+{
+  "name": "Zombie Bash 3D",
+  "description": "Бесконечный 3D экшен-ранер на выживание с генерацией облика героя по текстовому описанию через ИИ, боями подручными предметами разной редкости, разрушаемым окружением и битвами с боссами.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

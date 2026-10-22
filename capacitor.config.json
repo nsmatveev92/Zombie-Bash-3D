@@ -1,0 +1,9 @@
+{
+  "appId": "com.zombiebash3d.game",
+  "appName": "Zombie Bash 3D",
+  "webDir": "dist",
+  "bundledWebRuntime": false,
+  "server": {
+    "androidScheme": "https"
+  }
+}
