@@ -1146,6 +1146,7 @@ export interface ActiveBossHud {
   maxHp: number;
   phase: 1 | 2 | 3;
   phaseLabel: string;
+  isGrandBoss?: boolean;
 }
 
 export interface NearbyItemPrompt {
@@ -1185,6 +1186,8 @@ export interface GameHudState {
   stageNumber: number;
   stageAnnouncement: string | null;
   stageTransitionProgress: number;
+  isBerserk: boolean;
+  deathTimer: number;
   score: number;
   kills: number;
   bossesDefeated: number;
@@ -1201,4 +1204,404 @@ export interface GameHudState {
   perkLevels: Record<string, number>;
   levelUpChoices: PerkOption[];
   favoriteWeaponName: string;
+  runCoins: number;
 }
+
+export type MetaUpgradeId =
+  | 'meta_damage'
+  | 'meta_hp'
+  | 'meta_speed'
+  | 'meta_durability'
+  | 'meta_xp'
+  | 'meta_coins'
+  | 'meta_start_weapon'
+  | 'meta_regen'
+  | 'meta_crit'
+  | 'meta_armor';
+
+export interface MetaUpgradeDef {
+  id: MetaUpgradeId;
+  title: string;
+  shortTitle: string;
+  description: string;
+  icon: string;
+  color: string;
+  maxLevel: number;
+  baseCost: number;
+  costStep: number;
+  perLevelLabel: (lvl: number) => string;
+}
+
+export const META_UPGRADES: MetaUpgradeDef[] = [
+  {
+    id: 'meta_damage',
+    title: 'Сила крушения',
+    shortTitle: 'Урон',
+    description: 'Постоянно увеличивает урон кулаков и любого оружия',
+    icon: '⚔️',
+    color: '#F59E0B',
+    maxLevel: 15,
+    baseCost: 45,
+    costStep: 35,
+    perLevelLabel: (lvl) => `+${lvl * 8}% к урону`,
+  },
+  {
+    id: 'meta_hp',
+    title: 'Богатырское здоровье',
+    shortTitle: 'Здоровье',
+    description: 'Увеличивает максимальный запас здоровья со старта забега',
+    icon: '❤️',
+    color: '#22C55E',
+    maxLevel: 15,
+    baseCost: 40,
+    costStep: 30,
+    perLevelLabel: (lvl) => `+${lvl * 22} макс. HP`,
+  },
+  {
+    id: 'meta_speed',
+    title: 'Скороходы',
+    shortTitle: 'Скорость',
+    description: 'Повышает скорость бега и манёвренность персонажа',
+    icon: '👟',
+    color: '#10B981',
+    maxLevel: 10,
+    baseCost: 50,
+    costStep: 40,
+    perLevelLabel: (lvl) => `+${lvl * 4}% к скорости`,
+  },
+  {
+    id: 'meta_durability',
+    title: 'Титановая закалка',
+    shortTitle: 'Прочность',
+    description: 'Любое найденное оружие служит значительно дольше',
+    icon: '🛡️',
+    color: '#38BDF8',
+    maxLevel: 10,
+    baseCost: 45,
+    costStep: 35,
+    perLevelLabel: (lvl) => `+${lvl * 12}% прочности`,
+  },
+  {
+    id: 'meta_xp',
+    title: 'Магнит знаний',
+    shortTitle: 'Опыт (XP)',
+    description: 'Увеличивает количество опыта со всех кристаллов',
+    icon: '💎',
+    color: '#A855F7',
+    maxLevel: 10,
+    baseCost: 55,
+    costStep: 45,
+    perLevelLabel: (lvl) => `+${lvl * 10}% к опыту`,
+  },
+  {
+    id: 'meta_coins',
+    title: 'Золотая лихорадка',
+    shortTitle: 'Монеты',
+    description: 'Увеличивает добычу золотых монет с боссов, этапов и декораций',
+    icon: '🪙',
+    color: '#FACC15',
+    maxLevel: 10,
+    baseCost: 60,
+    costStep: 50,
+    perLevelLabel: (lvl) => `+${lvl * 12}% монет`,
+  },
+  {
+    id: 'meta_start_weapon',
+    title: 'Стартовый арсенал',
+    shortTitle: 'Старт-оружие',
+    description: 'Вы начинаете забег сразу с оружием в руках (выше уровень — выше редкость)',
+    icon: '🎸',
+    color: '#EC4899',
+    maxLevel: 4,
+    baseCost: 120,
+    costStep: 160,
+    perLevelLabel: (lvl) =>
+      lvl <= 0
+        ? 'Без оружия'
+        : lvl === 1
+        ? 'Обычное оружие'
+        : lvl === 2
+        ? 'Редкое оружие'
+        : lvl === 3
+        ? 'Эпическое оружие'
+        : 'Легендарное оружие',
+  },
+  {
+    id: 'meta_regen',
+    title: 'Живая кровь',
+    shortTitle: 'Регенерация',
+    description: 'Пассивно восстанавливает здоровье каждую секунду боя',
+    icon: '🧪',
+    color: '#FB7185',
+    maxLevel: 10,
+    baseCost: 65,
+    costStep: 50,
+    perLevelLabel: (lvl) => `+${(lvl * 1.5).toFixed(1)} HP/сек`,
+  },
+  {
+    id: 'meta_crit',
+    title: 'Критический раскол',
+    shortTitle: 'Шанс крита',
+    description: 'Шанс нанести 200% критического урона с золотой вспышкой',
+    icon: '💥',
+    color: '#F97316',
+    maxLevel: 10,
+    baseCost: 70,
+    costStep: 55,
+    perLevelLabel: (lvl) => `${lvl * 5}% шанс (2× урон)`,
+  },
+  {
+    id: 'meta_armor',
+    title: 'Каменная шкура',
+    shortTitle: 'Броня',
+    description: 'Снижает весь входящий урон от монстров и боссов',
+    icon: '🪨',
+    color: '#94A3B8',
+    maxLevel: 10,
+    baseCost: 65,
+    costStep: 50,
+    perLevelLabel: (lvl) => `-${lvl * 5}% входящего урона`,
+  },
+];
+
+export function getMetaUpgradeCost(def: MetaUpgradeDef, currentLevel: number): number {
+  return def.baseCost + currentLevel * def.costStep;
+}
+
+export type AchievementStatKey =
+  | 'totalKills'
+  | 'totalPropsSmashed'
+  | 'berserkKills'
+  | 'bossesKilled'
+  | 'grandBossesKilled'
+  | 'highestStageCleared'
+  | 'totalCoinsEarned'
+  | 'maxLevelReached';
+
+export interface AchievementDef {
+  id: string;
+  title: string;
+  description: string;
+  icon: string;
+  statKey: AchievementStatKey;
+  targetValue: number;
+  coinReward: number;
+  rewardTitle: string;
+  frameColor: string;
+}
+
+export const ACHIEVEMENTS_LIST: AchievementDef[] = [
+  {
+    id: 'ach_first_blood',
+    title: 'Первая сотня',
+    description: 'Сокрушите 100 монстров за все забеги',
+    icon: '⚔️',
+    statKey: 'totalKills',
+    targetValue: 100,
+    coinReward: 100,
+    rewardTitle: 'Охотник на Нежить',
+    frameColor: '#38BDF8',
+  },
+  {
+    id: 'ach_slayer_500',
+    title: 'Мясорубка',
+    description: 'Сокрушите 500 монстров за все забеги',
+    icon: '💀',
+    statKey: 'totalKills',
+    targetValue: 500,
+    coinReward: 250,
+    rewardTitle: 'Палач Орды',
+    frameColor: '#EF4444',
+  },
+  {
+    id: 'ach_slayer_1500',
+    title: 'Легенда Выживания',
+    description: 'Сокрушите 1 500 монстров за все забеги',
+    icon: '👑',
+    statKey: 'totalKills',
+    targetValue: 1500,
+    coinReward: 600,
+    rewardTitle: 'Бессмертный Император',
+    frameColor: '#FACC15',
+  },
+  {
+    id: 'ach_smasher_50',
+    title: 'Уличный Вандал',
+    description: 'Разнесите 50 декораций окружения (машин, домов, статуй)',
+    icon: '🔨',
+    statKey: 'totalPropsSmashed',
+    targetValue: 50,
+    coinReward: 120,
+    rewardTitle: 'Гроза Квартала',
+    frameColor: '#F97316',
+  },
+  {
+    id: 'ach_smasher_250',
+    title: 'Тотальный Демонтаж',
+    description: 'Разнесите 250 объектов окружения',
+    icon: '🚜',
+    statKey: 'totalPropsSmashed',
+    targetValue: 250,
+    coinReward: 320,
+    rewardTitle: 'Архитектор Хаоса',
+    frameColor: '#FB923C',
+  },
+  {
+    id: 'ach_berserk_30',
+    title: 'Кровавая Ярость',
+    description: 'Убейте 30 монстров, находясь в режиме Берсерка (HP < 20%)',
+    icon: '🔥',
+    statKey: 'berserkKills',
+    targetValue: 30,
+    coinReward: 220,
+    rewardTitle: 'Яростный Берсерк',
+    frameColor: '#F43F5E',
+  },
+  {
+    id: 'ach_berserk_120',
+    title: 'На Грани Смерти',
+    description: 'Убейте 120 монстров в режиме Берсерка',
+    icon: '🩸',
+    statKey: 'berserkKills',
+    targetValue: 120,
+    coinReward: 480,
+    rewardTitle: 'Неудержимый Демон',
+    frameColor: '#E11D48',
+  },
+  {
+    id: 'ach_boss_3',
+    title: 'Истребитель Гигантов',
+    description: 'Победите 3 боссов этапов',
+    icon: '🏆',
+    statKey: 'bossesKilled',
+    targetValue: 3,
+    coinReward: 180,
+    rewardTitle: 'Сокрушитель Боссов',
+    frameColor: '#A855F7',
+  },
+  {
+    id: 'ach_stage_10',
+    title: 'Покоритель Десятки',
+    description: 'Одолейте Гранд-Босса 10-го этапа и откройте чекпоинт 11-го этапа',
+    icon: '🌟',
+    statKey: 'highestStageCleared',
+    targetValue: 10,
+    coinReward: 500,
+    rewardTitle: 'Покоритель Десятки',
+    frameColor: '#F59E0B',
+  },
+  {
+    id: 'ach_stage_20',
+    title: 'Властелин Двадцатки',
+    description: 'Одолейте Гранд-Босса 20-го этапа и откройте чекпоинт 21-го этапа',
+    icon: '⚡',
+    statKey: 'highestStageCleared',
+    targetValue: 20,
+    coinReward: 1000,
+    rewardTitle: 'Владыка Арены',
+    frameColor: '#22D3EE',
+  },
+  {
+    id: 'ach_rich_1000',
+    title: 'Золотой Магнат',
+    description: 'Соберите суммарно 1 000 золотых монет',
+    icon: '💰',
+    statKey: 'totalCoinsEarned',
+    targetValue: 1000,
+    coinReward: 300,
+    rewardTitle: 'Золотой Барон',
+    frameColor: '#FDE047',
+  },
+  {
+    id: 'ach_level_12',
+    title: 'Мастер Навыков',
+    description: 'Достигните 12-го уровня персонажа в рамках одного забега',
+    icon: '✨',
+    statKey: 'maxLevelReached',
+    targetValue: 12,
+    coinReward: 280,
+    rewardTitle: 'Верховный Мастер',
+    frameColor: '#10B981',
+  },
+];
+
+export interface MetaProgressionState {
+  coins: number;
+  totalCoinsEarned: number;
+  upgradeLevels: Record<MetaUpgradeId, number>;
+  unlockedCheckpoints: number[];
+  selectedCheckpoint: number;
+  unlockedAchievements: string[];
+  selectedTitleAchievementId: string | null;
+  stats: {
+    totalKills: number;
+    totalPropsSmashed: number;
+    berserkKills: number;
+    bossesKilled: number;
+    grandBossesKilled: number;
+    highestStageCleared: number;
+    maxLevelReached: number;
+  };
+}
+
+export const DEFAULT_META_PROGRESSION: MetaProgressionState = {
+  coins: 120,
+  totalCoinsEarned: 120,
+  upgradeLevels: {
+    meta_damage: 0,
+    meta_hp: 0,
+    meta_speed: 0,
+    meta_durability: 0,
+    meta_xp: 0,
+    meta_coins: 0,
+    meta_start_weapon: 0,
+    meta_regen: 0,
+    meta_crit: 0,
+    meta_armor: 0,
+  },
+  unlockedCheckpoints: [1],
+  selectedCheckpoint: 1,
+  unlockedAchievements: [],
+  selectedTitleAchievementId: null,
+  stats: {
+    totalKills: 0,
+    totalPropsSmashed: 0,
+    berserkKills: 0,
+    bossesKilled: 0,
+    grandBossesKilled: 0,
+    highestStageCleared: 0,
+    maxLevelReached: 1,
+  },
+};
+
+export interface ComputedMetaBonuses {
+  damageMult: number;
+  bonusHp: number;
+  speedMult: number;
+  durabilityMult: number;
+  xpMult: number;
+  coinMult: number;
+  startWeaponTier: number;
+  hpRegenPerSec: number;
+  critChance: number;
+  damageReduction: number;
+}
+
+export function computeMetaBonuses(
+  meta: MetaProgressionState
+): ComputedMetaBonuses {
+  const u = meta.upgradeLevels || DEFAULT_META_PROGRESSION.upgradeLevels;
+  return {
+    damageMult: 1 + (u.meta_damage || 0) * 0.08,
+    bonusHp: (u.meta_hp || 0) * 22,
+    speedMult: 1 + (u.meta_speed || 0) * 0.04,
+    durabilityMult: 1 + (u.meta_durability || 0) * 0.12,
+    xpMult: 1 + (u.meta_xp || 0) * 0.1,
+    coinMult: 1 + (u.meta_coins || 0) * 0.12,
+    startWeaponTier: Math.min(4, u.meta_start_weapon || 0),
+    hpRegenPerSec: (u.meta_regen || 0) * 1.5,
+    critChance: Math.min(0.6, (u.meta_crit || 0) * 0.05),
+    damageReduction: Math.min(0.5, (u.meta_armor || 0) * 0.05),
+  };
+}
+

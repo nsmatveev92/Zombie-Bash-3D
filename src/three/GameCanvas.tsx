@@ -5,11 +5,14 @@ import {
   BIOMES,
   buildLeveledPerkOption,
   CharacterAppearance,
+  computeMetaBonuses,
+  DEFAULT_META_PROGRESSION,
   EnemyVariant,
   EquippedWeapon,
   GameHudState,
   GamePhase,
   getChainLightningCadence,
+  MetaProgressionState,
   PERK_POOL,
   PerkOption,
   RARITY_CONFIG,
@@ -30,15 +33,28 @@ import {
 } from './proceduralModels';
 import { soundEngine } from '../audio/soundEngine';
 
+export interface MetaGameplayEvent {
+  coinsAdded?: number;
+  killsAdded?: number;
+  propsSmashedAdded?: number;
+  berserkKillsAdded?: number;
+  bossesKilledAdded?: number;
+  grandBossesKilledAdded?: number;
+  stageCleared?: number;
+  levelReached?: number;
+}
+
 interface GameCanvasProps {
   appearance: CharacterAppearance;
+  metaProgression?: MetaProgressionState;
   phase: GamePhase;
   autoAttack: boolean;
   autoPickup: boolean;
   onHudUpdate: (state: GameHudState) => void;
   onSaveRun?: (saved: SavedRunState | null) => void;
+  onMetaEvent?: (event: MetaGameplayEvent) => void;
   registerActions: (actions: {
-    startNewGame: () => void;
+    startNewGame: (startStage?: number) => void;
     resumeSavedGame: (saved: SavedRunState) => void;
     selectPerk: (perkId: string) => void;
     togglePause: () => void;
@@ -118,6 +134,7 @@ interface ZombieEntity {
   variant: EnemyVariant;
   bossIndex: number;
   bossPhase: 1 | 2 | 3;
+  isGrandBoss?: boolean;
   rig: ZombieRigRefs;
   x: number;
   z: number;
@@ -190,11 +207,13 @@ interface ChunkData {
 
 export const GameCanvas: React.FC<GameCanvasProps> = ({
   appearance,
+  metaProgression = DEFAULT_META_PROGRESSION,
   phase,
   autoAttack,
   autoPickup,
   onHudUpdate,
   onSaveRun,
+  onMetaEvent,
   registerActions,
 }) => {
   const mountRef = useRef<HTMLDivElement | null>(null);
@@ -202,14 +221,18 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
   const autoAttackRef = useRef<boolean>(autoAttack);
   const autoPickupRef = useRef<boolean>(autoPickup);
   const appearanceRef = useRef<CharacterAppearance>(appearance);
+  const metaProgressionRef = useRef<MetaProgressionState>(metaProgression);
   const onHudUpdateRef = useRef(onHudUpdate);
   const onSaveRunRef = useRef(onSaveRun);
+  const onMetaEventRef = useRef(onMetaEvent);
 
   phaseRef.current = phase;
   autoAttackRef.current = autoAttack;
   autoPickupRef.current = autoPickup;
+  metaProgressionRef.current = metaProgression;
   onHudUpdateRef.current = onHudUpdate;
   onSaveRunRef.current = onSaveRun;
+  onMetaEventRef.current = onMetaEvent;
 
   const rebuildHeroFnRef = useRef<((app: CharacterAppearance) => void) | null>(
     null
@@ -307,24 +330,48 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
     rimLight.position.set(-16, 14, -18);
     scene.add(rimLight);
 
-    // Bright stylized ground tile texture
+    // Detailed procedural stone & cobble tile ground texture
     const createGroundGridTexture = () => {
       const c = document.createElement('canvas');
-      c.width = 256;
-      c.height = 256;
+      c.width = 512;
+      c.height = 512;
       const ctx = c.getContext('2d')!;
-      ctx.fillStyle = '#ffffff';
-      ctx.fillRect(0, 0, 256, 256);
-      ctx.strokeStyle = 'rgba(255,255,255,0.12)';
-      ctx.lineWidth = 2;
-      ctx.strokeRect(0, 0, 256, 256);
-      ctx.fillStyle = 'rgba(255,255,255,0.09)';
-      for (let i = 0; i < 120; i++) {
+      ctx.fillStyle = '#f1f5f9';
+      ctx.fillRect(0, 0, 512, 512);
+
+      // Stone slab grid with beveled highlights & mortar seams
+      const tileCount = 4;
+      const tileSize = 512 / tileCount;
+      for (let row = 0; row < tileCount; row++) {
+        for (let col = 0; col < tileCount; col++) {
+          const offsetX = (row % 2) * (tileSize * 0.5);
+          const x = ((col * tileSize + offsetX) % 512);
+          const y = row * tileSize;
+          const shade = 238 + Math.floor(Math.random() * 16);
+          ctx.fillStyle = `rgb(${shade},${shade},${shade})`;
+          ctx.fillRect(x + 3, y + 3, tileSize - 6, tileSize - 6);
+
+          // Top-left bevel highlight
+          ctx.strokeStyle = 'rgba(255,255,255,0.45)';
+          ctx.lineWidth = 2;
+          ctx.strokeRect(x + 4, y + 4, tileSize - 8, tileSize - 8);
+
+          // Mortar seam
+          ctx.strokeStyle = 'rgba(15,23,42,0.16)';
+          ctx.lineWidth = 3;
+          ctx.strokeRect(x + 1.5, y + 1.5, tileSize - 3, tileSize - 3);
+        }
+      }
+
+      // Subtle organic pebbles & surface grain
+      for (let i = 0; i < 240; i++) {
+        ctx.fillStyle =
+          i % 2 === 0 ? 'rgba(255,255,255,0.12)' : 'rgba(15,23,42,0.06)';
         ctx.beginPath();
         ctx.arc(
-          Math.random() * 256,
-          Math.random() * 256,
-          2 + Math.random() * 3,
+          Math.random() * 512,
+          Math.random() * 512,
+          1.5 + Math.random() * 3.5,
           0,
           Math.PI * 2
         );
@@ -719,10 +766,92 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
       touchMoveX: 0,
       touchMoveZ: 0,
       weaponPickupCooldown: 0,
+      wasBerserk: false,
+      deathAnimTimer: 0,
+      deathKickTimer: 0,
+      runCoins: 0,
     };
+
+    const getMetaBonuses = () =>
+      computeMetaBonuses(metaProgressionRef.current || DEFAULT_META_PROGRESSION);
+
+    const awardCoins = (baseAmount: number, x?: number, z?: number) => {
+      if (baseAmount <= 0) return;
+      const metaB = getMetaBonuses();
+      // Higher checkpoint tiers grant +50% coins per 10 stages (Stage 11 = 1.5x, Stage 21 = 2.0x)
+      const stageTierMult = 1 + Math.floor((sim.stageNumber - 1) / 10) * 0.5;
+      const earned = Math.max(
+        1,
+        Math.round(baseAmount * metaB.coinMult * stageTierMult)
+      );
+      sim.runCoins += earned;
+      if (x !== undefined && z !== undefined) {
+        spawnParticles(x, 1.15, z, 0xfacc15, Math.min(14, 3 + Math.floor(earned / 8)), 6.5);
+      }
+      onMetaEventRef.current?.({ coinsAdded: earned });
+    };
+
+    const isBerserkActive = () =>
+      sim.hp > 0 && sim.deathAnimTimer <= 0 && sim.hp / sim.maxHp < 0.2;
+
+    const getEffectiveDamageMult = () =>
+      sim.damageMult *
+      getMetaBonuses().damageMult *
+      (isBerserkActive() ? 1.5 : 1.0);
+
+    const getEffectiveSpeedMult = () =>
+      sim.speedMult *
+      getMetaBonuses().speedMult *
+      (isBerserkActive() ? 1.5 : 1.0);
 
     let heroRig: HeroRigRefs = createHeroRig(appearanceRef.current);
     scene.add(heroRig.root);
+
+    // Berserk Red Aura Ring under Hero
+    const berserkAuraGeo = new THREE.RingGeometry(0.65, 1.35, 32);
+    berserkAuraGeo.rotateX(-Math.PI / 2);
+    const berserkAuraMat = new THREE.MeshBasicMaterial({
+      color: 0xff1122,
+      transparent: true,
+      opacity: 0.75,
+      side: THREE.DoubleSide,
+      depthWrite: false,
+    });
+    const berserkAuraMesh = new THREE.Mesh(berserkAuraGeo, berserkAuraMat);
+    berserkAuraMesh.position.y = 0.06;
+    berserkAuraMesh.visible = false;
+    effectsRoot.add(berserkAuraMesh);
+
+    let heroEmissiveMats: THREE.MeshStandardMaterial[] = [];
+    const collectHeroMaterials = (rig: HeroRigRefs) => {
+      const mats = new Set<THREE.MeshStandardMaterial>();
+      rig.bodyGroup.traverse((child) => {
+        if (child instanceof THREE.Mesh && child.material) {
+          const mat = child.material;
+          if (mat instanceof THREE.MeshStandardMaterial) {
+            // Skip pure black/white eye meshes so eyes stay crisp
+            const hex = mat.color.getHex();
+            if (hex !== 0xffffff && hex !== 0x0f172a) {
+              mats.add(mat);
+            }
+          }
+        }
+      });
+      heroEmissiveMats = Array.from(mats);
+    };
+    collectHeroMaterials(heroRig);
+
+    const setHeroRedGlow = (intensity: number, colorHex = 0xff1122) => {
+      for (const m of heroEmissiveMats) {
+        if (intensity > 0) {
+          m.emissive.setHex(colorHex);
+          m.emissiveIntensity = intensity;
+        } else {
+          m.emissive.setHex(0x000000);
+          m.emissiveIntensity = 0;
+        }
+      }
+    };
 
     const equipWeaponVisual = (w: EquippedWeapon | null) => {
       while (heroRig.weaponSocket.children.length > 0) {
@@ -742,6 +871,7 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
       heroRig.root.position.copy(oldPos);
       heroRig.root.rotation.y = oldRot;
       scene.add(heroRig.root);
+      collectHeroMaterials(heroRig);
       equipWeaponVisual(sim.weapon);
     };
 
@@ -772,8 +902,12 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
       const chosenRarity = rarity || rollRarity(false);
       const tpl = WEAPON_TEMPLATES[chosenType];
       const rInfo = RARITY_CONFIG[chosenRarity];
+      const metaB = getMetaBonuses();
       const maxDur = Math.round(
-        tpl.baseDurability * rInfo.durabilityMult * sim.durabilityMult
+        tpl.baseDurability *
+          rInfo.durabilityMult *
+          sim.durabilityMult *
+          metaB.durabilityMult
       );
       return {
         uid: `${chosenType}_${Math.random().toString(36).slice(2, 8)}`,
@@ -1190,14 +1324,20 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
       }
 
       const bossIdx = sim.bossesDefeated % BOSS_ARCHETYPES.length;
+      const isGrandBoss = forceBoss && sim.stageNumber % 10 === 0;
       const currentBiome = BIOMES[sim.biomeIndex % BIOMES.length];
-      const rig = createZombieRig(variant, bossIdx, currentBiome.monsterPalette);
+      const rig = createZombieRig(
+        variant,
+        bossIdx,
+        currentBiome.monsterPalette,
+        isGrandBoss
+      );
       rig.root.position.set(zx, 0, zz);
       enemiesRoot.add(rig.root);
 
       const baseHp =
         variant === 'boss'
-          ? Math.round(680 * timeScale)
+          ? Math.round((isGrandBoss ? 1150 : 680) * timeScale)
           : variant === 'brute'
           ? Math.round(90 * timeScale)
           : variant === 'necromancer'
@@ -1214,7 +1354,9 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
 
       const speed =
         variant === 'boss'
-          ? 4.6
+          ? isGrandBoss
+            ? 5.0
+            : 4.6
           : variant === 'mini_skeleton'
           ? 6.6
           : variant === 'runner'
@@ -1231,7 +1373,9 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
 
       const damage =
         variant === 'boss'
-          ? 26
+          ? isGrandBoss
+            ? 34
+            : 26
           : variant === 'bomber'
           ? 22
           : variant === 'brute'
@@ -1245,6 +1389,7 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
         variant,
         bossIndex: bossIdx,
         bossPhase: 1,
+        isGrandBoss,
         rig,
         x: zx,
         z: zz,
@@ -1256,7 +1401,9 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
         damage,
         radius:
           variant === 'boss'
-            ? 1.45
+            ? isGrandBoss
+              ? 1.85
+              : 1.45
             : variant === 'brute'
             ? 0.85
             : variant === 'mini_skeleton'
@@ -1278,7 +1425,11 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
       zombies.push(zEntity);
       if (forceBoss) {
         soundEngine.playBossSpawn();
-        sim.shakeIntensity = 0.45;
+        sim.shakeIntensity = isGrandBoss ? 0.72 : 0.45;
+        if (isGrandBoss) {
+          sim.stageAnnouncement = `👑 ГРАНД-БОСС ${sim.stageNumber}-ГО ЭТАПА · ОТКРОЙ ЧЕКПОИНТ ${sim.stageNumber + 1}!`;
+          sim.stageAnnouncementTimer = 4.8;
+        }
       }
     };
 
@@ -1317,7 +1468,9 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
       if (zombies.length === 0) return;
       const lvl = sim.chainLightningLevel;
       const maxTargets = 4 + lvl * 2;
-      const lightningDmg = Math.round((70 + lvl * 40) * sim.damageMult);
+      const lightningDmg = Math.round(
+        (70 + lvl * 40) * getEffectiveDamageMult()
+      );
 
       const hitIndices: number[] = [];
       let curX = startX;
@@ -1461,6 +1614,8 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
         const deadX = zb.x;
         const deadZ = zb.z;
         const deadVariant = zb.variant;
+        const deadIsGrandBoss = Boolean(zb.isGrandBoss);
+        const wasBerserk = isBerserkActive();
         enemiesRoot.remove(zb.rig.root);
         zombies.splice(index, 1);
         sim.kills += 1;
@@ -1474,6 +1629,24 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
             : 50;
         sim.score +=
           scoreGain * Math.min(5, 1 + Math.floor(sim.comboCount / 6));
+
+        // Award Gold Coins for kills and Boss/Stage clears
+        if (deadVariant === 'boss') {
+          awardCoins(deadIsGrandBoss ? 180 : 75, deadX, deadZ);
+        } else if (deadVariant === 'brute' || deadVariant === 'necromancer') {
+          awardCoins(8, deadX, deadZ);
+        } else if (Math.random() < 0.35) {
+          awardCoins(3, deadX, deadZ);
+        }
+
+        onMetaEventRef.current?.({
+          killsAdded: 1,
+          berserkKillsAdded: wasBerserk ? 1 : 0,
+          bossesKilledAdded: deadVariant === 'boss' ? 1 : 0,
+          grandBossesKilledAdded:
+            deadVariant === 'boss' && deadIsGrandBoss ? 1 : 0,
+          stageCleared: deadVariant === 'boss' ? sim.stageNumber : undefined,
+        });
 
         spawnParticles(
           deadX,
@@ -1511,6 +1684,18 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
       destructiblesRoot.remove(prop.mesh);
       destructibles.splice(index, 1);
       sim.score += prop.kind === 'house' ? 250 : prop.kind === 'car' ? 150 : 50;
+
+      // Award Gold Coins and track smashed props for achievements
+      const basePropCoins =
+        prop.kind === 'house' || prop.kind === 'windmill'
+          ? 12
+          : prop.kind === 'car' ||
+            prop.kind === 'crystal_cluster' ||
+            prop.kind === 'statue'
+          ? 7
+          : 3;
+      awardCoins(basePropCoins, prop.x, prop.z);
+      onMetaEventRef.current?.({ propsSmashedAdded: 1 });
 
       if (prop.kind === 'barrel') {
         triggerExplosion(prop.x, prop.z, 5.5, 140, 0xf97316, 0xfacc15);
@@ -1581,16 +1766,22 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
 
     // Perform Melee Attack + Proc Skills!
     const performAttack = () => {
-      if (sim.attackCooldownTimer > 0 || phaseRef.current !== 'playing') return;
+      if (
+        sim.attackCooldownTimer > 0 ||
+        sim.deathAnimTimer > 0 ||
+        phaseRef.current !== 'playing'
+      )
+        return;
 
+      const effDamageMult = getEffectiveDamageMult();
       const w = sim.weapon;
       const baseDamage = w ? w.damage : 18;
-      const totalDamage = Math.round(baseDamage * sim.damageMult);
+      const totalDamage = Math.round(baseDamage * effDamageMult);
       const range = (w ? w.range : 2.5) * sim.rangeMult;
       const arcAngle = (w ? w.arcAngle : Math.PI * 0.7) * sim.rangeMult;
       const cooldown =
         (w ? w.cooldown : 0.32) / Math.max(0.5, sim.attackSpeedMult);
-      const knockback = (w ? w.knockback : 5.0) * sim.damageMult;
+      const knockback = (w ? w.knockback : 5.0) * effDamageMult;
       const soundType = w ? w.soundType : 'fist';
 
       sim.attackCooldownTimer = cooldown;
@@ -1604,7 +1795,13 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
       slashMesh.position.set(sim.playerX, 0.85, sim.playerZ);
       slashMesh.rotation.y = sim.facingAngle - Math.PI / 2;
       slashMesh.scale.setScalar(range / 3.2);
-      slashMat.color.setHex(w ? RARITY_CONFIG[w.rarity].hex : 0xf8fafc);
+      slashMat.color.setHex(
+        isBerserkActive()
+          ? 0xff1122
+          : w
+          ? RARITY_CONFIG[w.rarity].hex
+          : 0xf8fafc
+      );
       slashMat.opacity = 0.75;
       slashMesh.visible = true;
 
@@ -1627,9 +1824,14 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
           if (dot >= cosHalfArc || dist < 1.35) {
             hitAnything = true;
             const isLastHit = w ? w.durability === 1 : false;
-            const finalDmg = isLastHit
-              ? Math.round(totalDamage * 1.75)
-              : totalDamage;
+            const isCrit = Math.random() < getMetaBonuses().critChance;
+            const critMult = isCrit ? 2.0 : 1.0;
+            const finalDmg = Math.round(
+              totalDamage * (isLastHit ? 1.75 : 1.0) * critMult
+            );
+            if (isCrit) {
+              spawnParticles(zb.x, 1.35, zb.z, 0xfde047, 10, 8.5);
+            }
             damageZombie(i, finalDmg, ndx, ndz, knockback);
           }
         }
@@ -1670,7 +1872,7 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
           soundEngine.playMagicNova();
           const fireRadius = 5.0 + sim.fireNovaLevel * 1.2;
           const fireDmg = Math.round(
-            (45 + sim.fireNovaLevel * 32) * sim.damageMult
+            (45 + sim.fireNovaLevel * 32) * effDamageMult
           );
           triggerExplosion(
             sim.playerX,
@@ -1690,7 +1892,7 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
           soundEngine.playMagicNova();
           const frostRadius = 5.5 + sim.frostNovaLevel * 1.25;
           const frostDmg = Math.round(
-            (34 + sim.frostNovaLevel * 26) * sim.damageMult
+            (34 + sim.frostNovaLevel * 26) * effDamageMult
           );
           triggerNovaWaveVisual(
             sim.playerX,
@@ -1717,7 +1919,7 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
           soundEngine.playMagicNova();
           const healAmt = 10 + sim.vampiricLevel * 6;
           const vampDmg = Math.round(
-            (38 + sim.vampiricLevel * 26) * sim.damageMult
+            (38 + sim.vampiricLevel * 26) * effDamageMult
           );
           sim.hp = Math.min(sim.maxHp, sim.hp + healAmt);
           triggerNovaWaveVisual(sim.playerX, sim.playerZ, 0xf43f5e, 5.4);
@@ -1759,7 +1961,9 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
                 sim.playerX,
                 sim.playerZ,
                 4.8 + sim.shatterBlastLevel * 0.6,
-                Math.round((140 + sim.shatterBlastLevel * 75) * sim.damageMult)
+                Math.round(
+                  (140 + sim.shatterBlastLevel * 75) * effDamageMult
+                )
               );
             }
             sim.weapon = null;
@@ -1842,7 +2046,7 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
       }
     };
 
-    const startNewGame = () => {
+    const startNewGame = (customStartStage?: number) => {
       for (const z of zombies) enemiesRoot.remove(z.rig.root);
       zombies.length = 0;
       for (const gw of groundWeapons) {
@@ -1864,28 +2068,41 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
       }
       hideAllBossTelegraphs();
 
+      const startStage = Math.max(
+        1,
+        customStartStage ??
+          metaProgressionRef.current?.selectedCheckpoint ??
+          1
+      );
+      const startBiomeIdx = (startStage - 1) % BIOMES.length;
+      const startBiome = BIOMES[startBiomeIdx];
+      const metaB = getMetaBonuses();
+
       sim.playerX = 0;
       sim.playerZ = 0;
       sim.playerVx = 0;
       sim.playerVz = 0;
       sim.facingAngle = 0;
-      sim.hp = 130;
-      sim.maxHp = 130;
+      sim.maxHp = 130 + metaB.bonusHp;
+      sim.hp = sim.maxHp;
       sim.xp = 0;
       sim.xpToNext = 260;
       sim.level = 1;
-      sim.stageNumber = 1;
+      sim.stageNumber = startStage;
       sim.stageTime = 0;
       sim.stageTransitionTimer = 0;
       sim.stageTransitionSwapped = false;
-      sim.stageAnnouncement = 'УРОВЕНЬ 1 · СОЛНЕЧНЫЙ БУЛЬВАР';
+      sim.stageAnnouncement =
+        startStage > 1
+          ? `ЧЕКПОИНТ · ЭТАП ${startStage} · ${startBiome.name.toUpperCase()}`
+          : `УРОВЕНЬ 1 · ${startBiome.name.toUpperCase()}`;
       sim.stageAnnouncementTimer = 3.5;
       sim.score = 0;
       sim.kills = 0;
-      sim.bossesDefeated = 0;
+      sim.bossesDefeated = startStage - 1;
       sim.elapsedTime = 0;
       sim.nextBossTimer = BOSS_INTERVAL;
-      sim.biomeIndex = 0;
+      sim.biomeIndex = startBiomeIdx;
       sim.comboCount = 0;
       sim.hitCount = 0;
       sim.activePerks = [];
@@ -1910,12 +2127,34 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
       sim.weaponUsageCount = {};
       sim.waveSurgeTimer = 20;
       sim.enemySpawnTimer = 1.0;
+      sim.wasBerserk = false;
+      sim.deathAnimTimer = 0;
+      sim.deathKickTimer = 0;
+      sim.runCoins = 0;
+      berserkAuraMesh.visible = false;
+      orbitBladesGroup.visible = true;
+      setHeroRedGlow(0);
 
-      applyBiomePalette(0, true);
+      applyBiomePalette(startBiomeIdx, true);
       heroRig.root.position.set(0, 0, 0);
-      heroRig.root.rotation.y = 0;
+      heroRig.root.rotation.set(0, 0, 0);
+      heroRig.bodyGroup.position.set(0, 0, 0);
 
-      sim.weapon = createWeaponInstance('frying_pan', 'common');
+      // Apply Starting Weapon from Meta-Progression ("Стартовый арсенал")
+      const startRarityMap: Record<number, WeaponRarity> = {
+        1: 'common',
+        2: 'rare',
+        3: 'epic',
+        4: 'legendary',
+      };
+      if (metaB.startWeaponTier > 0) {
+        sim.weapon = createWeaponInstance(
+          undefined,
+          startRarityMap[metaB.startWeaponTier] || 'common'
+        );
+      } else {
+        sim.weapon = createWeaponInstance('frying_pan', 'common');
+      }
       equipWeaponVisual(sim.weapon);
 
       spawnGroundWeapon(4.2, 3.2, 'baseball_bat', 'rare');
@@ -1970,6 +2209,12 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
       sim.stageTime = 0;
       sim.stageTransitionTimer = 0;
       sim.stageTransitionSwapped = false;
+      sim.wasBerserk = false;
+      sim.deathAnimTimer = 0;
+      sim.deathKickTimer = 0;
+      berserkAuraMesh.visible = false;
+      orbitBladesGroup.visible = true;
+      setHeroRedGlow(0);
       sim.score = saved.score || 0;
       sim.kills = saved.kills || 0;
       sim.bossesDefeated = saved.bossesDefeated || 0;
@@ -2012,7 +2257,8 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
 
       applyBiomePalette(sim.biomeIndex, true);
       heroRig.root.position.set(0, 0, 0);
-      heroRig.root.rotation.y = 0;
+      heroRig.root.rotation.set(0, 0, 0);
+      heroRig.bodyGroup.position.set(0, 0, 0);
 
       sim.weapon =
         saved.weapon || createWeaponInstance('frying_pan', 'rare');
@@ -2116,7 +2362,7 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
       sim.hudSyncTimer = 0;
 
       // Save or clear persistent run progress
-      if (phaseRef.current === 'gameover') {
+      if (phaseRef.current === 'gameover' || sim.deathAnimTimer > 0) {
         onSaveRunRef.current?.(null);
       } else if (
         (phaseRef.current === 'playing' ||
@@ -2150,11 +2396,14 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
       const bossEntity = zombies.find((z) => z.variant === 'boss');
       const activeBoss = bossEntity
         ? {
-            name: BOSS_ARCHETYPES[bossEntity.bossIndex].name,
+            name: bossEntity.isGrandBoss
+              ? `ВЛАДЫКА ДЕСЯТКИ: ${BOSS_ARCHETYPES[bossEntity.bossIndex].name}`
+              : BOSS_ARCHETYPES[bossEntity.bossIndex].name,
             subtitle: BOSS_ARCHETYPES[bossEntity.bossIndex].subtitle,
             hp: Math.max(0, Math.ceil(bossEntity.hp)),
             maxHp: bossEntity.maxHp,
             phase: bossEntity.bossPhase,
+            isGrandBoss: Boolean(bossEntity.isGrandBoss),
             phaseLabel:
               bossEntity.bossPhase === 3
                 ? 'СТАДИЯ 3/3 · БЕРСЕРК!'
@@ -2173,7 +2422,7 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
           nearbyItem = {
             name: gw.weapon.name,
             rarity: gw.weapon.rarity,
-            damage: Math.round(gw.weapon.damage * sim.damageMult),
+            damage: Math.round(gw.weapon.damage * getEffectiveDamageMult()),
           };
         }
       }
@@ -2191,6 +2440,8 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
           sim.stageTransitionTimer > 0
             ? Math.sin((1 - sim.stageTransitionTimer / 1.5) * Math.PI)
             : 0,
+        isBerserk: isBerserkActive(),
+        deathTimer: Math.max(0, sim.deathAnimTimer),
         score: sim.score,
         kills: sim.kills,
         bossesDefeated: sim.bossesDefeated,
@@ -2207,7 +2458,57 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
         perkLevels: { ...sim.perkLevels },
         levelUpChoices: sim.levelUpChoices,
         favoriteWeaponName: getFavoriteWeapon(),
+        runCoins: sim.runCoins,
       });
+    };
+
+    const triggerDeathBeatdown = () => {
+      if (sim.deathAnimTimer > 0) return;
+      sim.hp = 0;
+      sim.deathAnimTimer = 5.0;
+      sim.deathKickTimer = 0.1;
+      sim.playerVx = 0;
+      sim.playerVz = 0;
+      sim.wasBerserk = false;
+      berserkAuraMesh.visible = false;
+      slashMesh.visible = false;
+      orbitBladesGroup.visible = false;
+      hideAllBossTelegraphs();
+      setHeroRedGlow(0);
+
+      for (const ep of enemyProjectiles) {
+        ep.active = false;
+        ep.mesh.visible = false;
+      }
+
+      // Ensure a full crowd of at least 10 monsters surrounds the fallen hero to kick them!
+      const needed = Math.max(0, 10 - zombies.length);
+      for (let k = 0; k < needed; k++) {
+        const a = (k / Math.max(1, needed)) * Math.PI * 2;
+        spawnZombie(
+          false,
+          undefined,
+          k % 2 === 0 ? 'runner' : 'walker',
+          sim.playerX + Math.cos(a) * 2.8,
+          sim.playerZ + Math.sin(a) * 2.8
+        );
+      }
+
+      // Pull far monsters closer so the crowd forms immediately around the fallen player
+      for (let i = 0; i < zombies.length; i++) {
+        const zb = zombies[i];
+        if (!zb) continue;
+        const d = Math.hypot(zb.x - sim.playerX, zb.z - sim.playerZ);
+        if (d > 5.0) {
+          const a = (i / Math.max(1, zombies.length)) * Math.PI * 2;
+          zb.x = clampToArena(sim.playerX + Math.cos(a) * 3.0, 1.4);
+          zb.z = clampToArena(sim.playerZ + Math.sin(a) * 3.0, 1.4);
+        }
+      }
+
+      soundEngine.playPlayerHurt();
+      sim.shakeIntensity = 0.45;
+      syncHud(true);
     };
 
     updateChunksAroundPlayer();
@@ -2280,9 +2581,154 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
       } else if (phaseRef.current === 'playing') {
         if (sim.hitstopTimer > 0) {
           sim.hitstopTimer -= dt;
+        } else if (sim.deathAnimTimer > 0) {
+          // ==================== 5-SECOND DEATH ANIMATION: CROWD OF MONSTERS KICKING FALLEN HERO ====================
+          sim.elapsedTime += dt;
+          sim.deathAnimTimer -= dt;
+          sim.deathKickTimer -= dt;
+
+          // Fallen Hero on the ground getting jolted by kicks
+          heroRig.root.position.set(sim.playerX, 0.28, sim.playerZ);
+          heroRig.root.rotation.x = -Math.PI * 0.46;
+          heroRig.root.rotation.z = Math.sin(sim.elapsedTime * 26) * 0.22;
+          heroRig.root.rotation.y += dt * 1.2;
+
+          heroRig.bodyGroup.position.set(
+            Math.sin(sim.elapsedTime * 38) * 0.14,
+            Math.abs(Math.sin(sim.elapsedTime * 28)) * 0.18,
+            0
+          );
+          heroRig.leftArm.rotation.x = -0.8 + Math.sin(sim.elapsedTime * 22) * 0.55;
+          heroRig.rightArm.rotation.x = -0.8 - Math.sin(sim.elapsedTime * 22) * 0.55;
+          heroRig.leftLeg.rotation.x = Math.sin(sim.elapsedTime * 19) * 0.45;
+          heroRig.rightLeg.rotation.x = -Math.sin(sim.elapsedTime * 19) * 0.45;
+
+          // Periodic kick impact sound, flash & particles
+          if (sim.deathKickTimer <= 0) {
+            sim.deathKickTimer = 0.18;
+            soundEngine.playHit('fist', false);
+            if (Math.random() < 0.35) {
+              soundEngine.playPlayerHurt();
+            }
+            sim.shakeIntensity = 0.24;
+            setHeroRedGlow(0.85, 0xff2233);
+            spawnParticles(
+              sim.playerX + (Math.random() - 0.5) * 0.9,
+              0.45,
+              sim.playerZ + (Math.random() - 0.5) * 0.9,
+              Math.random() > 0.45 ? 0xfacc15 : 0xef4444,
+              6,
+              5.8
+            );
+          } else if (sim.deathKickTimer < 0.09) {
+            setHeroRedGlow(0);
+          }
+
+          // Crowd of monsters gathers in a tight circle around the fallen hero and kicks with their feet!
+          const totalMob = Math.max(1, zombies.length);
+          for (let i = 0; i < zombies.length; i++) {
+            const zb = zombies[i];
+            if (!zb) continue;
+            const ringAngle = (i / totalMob) * Math.PI * 2 + sim.elapsedTime * 0.3;
+            const ringRadius = 1.18 + zb.radius * 0.55;
+            const targetX = sim.playerX + Math.cos(ringAngle) * ringRadius;
+            const targetZ = sim.playerZ + Math.sin(ringAngle) * ringRadius;
+
+            zb.x = THREE.MathUtils.damp(zb.x, targetX, 8, dt);
+            zb.z = THREE.MathUtils.damp(zb.z, targetZ, 8, dt);
+            zb.rig.root.position.set(zb.x, 0, zb.z);
+            zb.rig.root.rotation.y = Math.atan2(
+              sim.playerX - zb.x,
+              sim.playerZ - zb.z
+            );
+
+            // Fast alternating leg kicks directed at the fallen player
+            zb.walkPhase += dt * 21;
+            const kickWave = Math.sin(zb.walkPhase + i * 0.9);
+            if (kickWave > 0) {
+              // Kick left leg forward & up
+              zb.rig.leftLeg.rotation.x = -kickWave * 1.48;
+              zb.rig.rightLeg.rotation.x = 0.18;
+            } else {
+              // Kick right leg forward & up
+              zb.rig.rightLeg.rotation.x = kickWave * 1.48;
+              zb.rig.leftLeg.rotation.x = 0.18;
+            }
+            zb.rig.bodyGroup.position.y = Math.abs(kickWave) * 0.14;
+            zb.rig.leftArm.rotation.x = -0.65 + kickWave * 0.45;
+            zb.rig.rightArm.rotation.x = -0.65 - kickWave * 0.45;
+          }
+
+          // Update Pooled Particles & Nova Waves during death beatdown
+          for (const nw of novaWaves) {
+            if (!nw.active) continue;
+            nw.life += dt;
+            if (nw.life >= nw.maxLife) {
+              nw.active = false;
+              nw.mesh.visible = false;
+              continue;
+            }
+            const p = nw.life / nw.maxLife;
+            nw.mesh.scale.setScalar(0.5 + p * nw.maxScale);
+            nw.mat.opacity = (1 - p) * 0.85;
+          }
+
+          for (const p of particles) {
+            if (!p.active) continue;
+            p.life += dt;
+            if (p.life >= p.maxLife) {
+              p.active = false;
+              p.mesh.visible = false;
+              continue;
+            }
+            p.vy -= 14 * dt;
+            p.mesh.position.x += p.vx * dt;
+            p.mesh.position.y = Math.max(0.08, p.mesh.position.y + p.vy * dt);
+            p.mesh.position.z += p.vz * dt;
+            const s = (1 - p.life / p.maxLife) * 0.95;
+            p.mesh.scale.setScalar(s);
+          }
+
+          // Zoomed-in dramatic camera on the mob kicking the hero
+          if (sim.shakeIntensity > 0) {
+            sim.shakeIntensity = Math.max(0, sim.shakeIntensity - dt * 2.2);
+          }
+          const shakeX = (Math.random() - 0.5) * sim.shakeIntensity;
+          const shakeZ = (Math.random() - 0.5) * sim.shakeIntensity;
+          const portraitZoom =
+            camera.aspect < 0.85
+              ? Math.min(1.32, Math.max(1.0, 0.86 / Math.max(0.45, camera.aspect)))
+              : 1.0;
+
+          _camTargetPos.set(
+            sim.playerX + shakeX,
+            11.2 * portraitZoom,
+            sim.playerZ + 10.2 * portraitZoom + shakeZ
+          );
+          camera.position.lerp(_camTargetPos, 1 - Math.exp(-6 * dt));
+          _camLookAt.set(sim.playerX + shakeX, 0.45, sim.playerZ + shakeZ);
+          camera.lookAt(_camLookAt);
+
+          syncHud(false);
+
+          if (sim.deathAnimTimer <= 0) {
+            sim.deathAnimTimer = 0;
+            setHeroRedGlow(0);
+            heroRig.root.rotation.set(0, 0, 0);
+            heroRig.bodyGroup.position.set(0, 0, 0);
+            orbitBladesGroup.visible = true;
+            phaseRef.current = 'gameover';
+            syncHud(true);
+          }
         } else {
           sim.elapsedTime += dt;
           sim.saveRunTimer += dt;
+
+          // Passive HP Regeneration from Meta-Progression ("Живая кровь")
+          const hpRegen = getMetaBonuses().hpRegenPerSec;
+          if (hpRegen > 0 && sim.hp > 0 && sim.hp < sim.maxHp) {
+            sim.hp = Math.min(sim.maxHp, sim.hp + hpRegen * dt);
+          }
 
           // "ВЖУХ!" Stage Transition Animation (Portal Warp to Fresh Level)
           if (sim.stageTransitionTimer > 0) {
@@ -2411,7 +2857,7 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
                 5.0 - sim.meteorStrikeLevel * 0.65
               );
               const meteorDmg = Math.round(
-                (95 + sim.meteorStrikeLevel * 45) * sim.damageMult
+                (95 + sim.meteorStrikeLevel * 45) * getEffectiveDamageMult()
               );
               const meteorRadius = 3.8 + sim.meteorStrikeLevel * 0.45;
               const volleyCount = Math.min(
@@ -2444,7 +2890,7 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
             if (sim.orbitDamageCooldown <= 0) {
               sim.orbitDamageCooldown = 0.2;
               const bladeDmg = Math.round(
-                (24 + sim.orbitBladesLevel * 14) * sim.damageMult
+                (24 + sim.orbitBladesLevel * 14) * getEffectiveDamageMult()
               );
               for (const bMesh of bladeMeshes) {
                 bMesh.getWorldPosition(_bladeWorldPos);
@@ -2465,7 +2911,7 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
             }
           }
 
-          // 360° WASD + Mobile Touch Finger Drag Movement
+          // 360° WASD + Mobile Touch Finger Drag Movement (+50% speed in Berserk Mode!)
           let moveX = sim.touchMoveX;
           let moveZ = sim.touchMoveZ;
           if (heldKeys.has('KeyW') || heldKeys.has('ArrowUp')) moveZ -= 1;
@@ -2474,7 +2920,7 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
           if (heldKeys.has('KeyD') || heldKeys.has('ArrowRight')) moveX += 1;
 
           const moveLen = Math.hypot(moveX, moveZ);
-          const maxSpeed = 8.8 * sim.speedMult;
+          const maxSpeed = 8.8 * getEffectiveSpeedMult();
           if (moveLen > 0.04) {
             const clampedLen = Math.min(1, moveLen);
             moveX = (moveX / moveLen) * clampedLen;
@@ -2532,8 +2978,43 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
           updateChunksAroundPlayer();
 
           heroRig.root.position.set(sim.playerX, 0, sim.playerZ);
+          heroRig.root.rotation.x = 0;
+          heroRig.root.rotation.z = 0;
           if (sim.stageTransitionTimer <= 0) {
             heroRig.root.rotation.y = sim.facingAngle;
+          }
+
+          // ==================== BERSERK MODE (< 20% HP): RED GLOW + AURA + +50% DAMAGE & SPEED ====================
+          const berserkNow = isBerserkActive();
+          if (berserkNow) {
+            if (!sim.wasBerserk) {
+              sim.wasBerserk = true;
+              soundEngine.playMagicNova();
+              triggerNovaWaveVisual(sim.playerX, sim.playerZ, 0xff1122, 7.5);
+              spawnParticles(sim.playerX, 1.1, sim.playerZ, 0xff1122, 22, 8.5);
+            }
+            const redPulse = 0.58 + Math.sin(sim.elapsedTime * 15) * 0.32;
+            setHeroRedGlow(redPulse, 0xff1122);
+            berserkAuraMesh.visible = true;
+            berserkAuraMesh.position.set(sim.playerX, 0.06, sim.playerZ);
+            berserkAuraMesh.scale.setScalar(
+              1.0 + Math.sin(sim.elapsedTime * 14) * 0.18
+            );
+            berserkAuraMat.opacity = 0.55 + Math.sin(sim.elapsedTime * 14) * 0.25;
+            if (Math.random() < 0.45) {
+              spawnParticles(
+                sim.playerX + (Math.random() - 0.5) * 0.9,
+                0.55,
+                sim.playerZ + (Math.random() - 0.5) * 0.9,
+                0xff1122,
+                1,
+                3.8
+              );
+            }
+          } else if (sim.wasBerserk) {
+            sim.wasBerserk = false;
+            berserkAuraMesh.visible = false;
+            setHeroRedGlow(0);
           }
 
           const speedMag = Math.hypot(sim.playerVx, sim.playerVz);
@@ -2799,8 +3280,12 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
                       Math.abs(sim.playerZ - zb.z) < 1.35
                     ) {
                       if (dist < 12) {
-                        sim.hp -= 24;
+                        const dmgMult = 1 - getMetaBonuses().damageReduction;
+                        sim.hp -= 24 * dmgMult;
                         soundEngine.playPlayerHurt();
+                        if (sim.hp <= 0) {
+                          triggerDeathBeatdown();
+                        }
                       }
                     }
                     const baseAngle = Math.atan2(dx, dz);
@@ -2825,8 +3310,12 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
                       if (
                         Math.hypot(sim.playerX - t.x, sim.playerZ - t.z) < 3.3
                       ) {
-                        sim.hp -= 22;
+                        const dmgMult = 1 - getMetaBonuses().damageReduction;
+                        sim.hp -= 22 * dmgMult;
                         soundEngine.playPlayerHurt();
+                        if (sim.hp <= 0) {
+                          triggerDeathBeatdown();
+                        }
                       }
                     }
                     for (let r = 0; r < 8; r++) {
@@ -2846,8 +3335,12 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
                     triggerNovaWaveVisual(zb.x, zb.z, 0xef4444, 5.4);
                     spawnParticles(zb.x, 0.5, zb.z, 0xef4444, 22, 9);
                     if (dist < 5.4) {
-                      sim.hp -= 25;
+                      const dmgMult = 1 - getMetaBonuses().damageReduction;
+                      sim.hp -= 25 * dmgMult;
                       soundEngine.playPlayerHurt();
+                      if (sim.hp <= 0) {
+                        triggerDeathBeatdown();
+                      }
                     }
                   }
 
@@ -2933,15 +3426,15 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
 
             const hitDist = 0.55 + zb.radius;
             if (dist < hitDist) {
-              sim.hp -= zb.damage * dt * 1.45;
+              const dmgMult = 1 - getMetaBonuses().damageReduction;
+              sim.hp -= zb.damage * dmgMult * dt * 1.45;
               if (Math.random() < 0.08) {
                 soundEngine.playPlayerHurt();
                 sim.shakeIntensity = Math.max(sim.shakeIntensity, 0.22);
               }
               if (sim.hp <= 0) {
-                sim.hp = 0;
-                phaseRef.current = 'gameover';
-                syncHud(true);
+                triggerDeathBeatdown();
+                break;
               }
             }
           }
@@ -2970,14 +3463,14 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
             if (dToPlayer < 0.75) {
               ep.active = false;
               ep.mesh.visible = false;
-              sim.hp -= ep.damage;
+              const dmgMult = 1 - getMetaBonuses().damageReduction;
+              sim.hp -= ep.damage * dmgMult;
               soundEngine.playPlayerHurt();
               sim.shakeIntensity = Math.max(sim.shakeIntensity, 0.25);
               spawnParticles(sim.playerX, 1.0, sim.playerZ, 0xd946ef, 8, 5);
               if (sim.hp <= 0) {
-                sim.hp = 0;
-                phaseRef.current = 'gameover';
-                syncHud(true);
+                triggerDeathBeatdown();
+                break;
               }
             }
           }
@@ -2996,7 +3489,7 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
             nw.mat.opacity = (1 - p) * 0.85;
           }
 
-          // Update XP Gems
+          // Update XP Gems (with Meta XP Multiplier!)
           for (const g of xpGems) {
             if (!g.active) continue;
             g.mesh.rotation.y += dt * 3;
@@ -3012,11 +3505,12 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
                 g.active = false;
                 g.mesh.visible = false;
                 soundEngine.playXpGem();
-                sim.xp += g.value;
+                sim.xp += Math.round(g.value * getMetaBonuses().xpMult);
                 if (sim.xp >= sim.xpToNext) {
                   sim.xp -= sim.xpToNext;
                   sim.level += 1;
                   sim.xpToNext = Math.round(sim.xpToNext * 1.55 + 85);
+                  onMetaEventRef.current?.({ levelReached: sim.level });
                   triggerLevelUpModal();
                 }
               }

@@ -1,23 +1,32 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
+  ACHIEVEMENTS_LIST,
+  AchievementDef,
   BIOMES,
   CHARACTER_PRESETS,
   CharacterAppearance,
+  DEFAULT_META_PROGRESSION,
   EarsType,
   GameHudState,
   getChainLightningCadence,
+  getMetaUpgradeCost,
+  META_UPGRADES,
+  MetaProgressionState,
+  MetaUpgradeId,
   MuzzleType,
   PERK_POOL,
   RARITY_CONFIG,
   SavedRunState,
   TailType,
 } from './types/game';
-import { GameCanvas } from './three/GameCanvas';
+import { GameCanvas, MetaGameplayEvent } from './three/GameCanvas';
 import { soundEngine } from './audio/soundEngine';
+import { SkillIcon } from './components/SkillIcon';
 
 const STORAGE_KEY_APPEARANCE = 'zombie_bash_3d_appearance_v1';
 const STORAGE_KEY_BEST_SCORE = 'zombie_bash_3d_best_score_v1';
 const STORAGE_KEY_SAVED_RUN = 'zombie_bash_3d_saved_run_v1';
+const STORAGE_KEY_META = 'zombie_bash_3d_meta_v1';
 
 const INITIAL_HUD: GameHudState = {
   phase: 'title',
@@ -29,9 +38,12 @@ const INITIAL_HUD: GameHudState = {
   stageNumber: 1,
   stageAnnouncement: null,
   stageTransitionProgress: 0,
+  isBerserk: false,
+  deathTimer: 0,
   score: 0,
   kills: 0,
   bossesDefeated: 0,
+  runCoins: 0,
   elapsedTime: 0,
   nextBossIn: 60,
   biomeIndex: 0,
@@ -86,7 +98,9 @@ export default function App() {
   const [muted, setMuted] = useState<boolean>(false);
   const [dockCollapsed, setDockCollapsed] = useState<boolean>(false);
   const [titleMinimized, setTitleMinimized] = useState<boolean>(false);
-  const [titleTab, setTitleTab] = useState<'ai' | 'parts' | 'presets'>('ai');
+  const [titleTab, setTitleTab] = useState<
+    'upgrades' | 'achievements' | 'ai' | 'parts' | 'presets'
+  >('upgrades');
   const [installPromptEvent, setInstallPromptEvent] = useState<any>(null);
   const [bestScore, setBestScore] = useState<number>(() => {
     try {
@@ -107,12 +121,194 @@ export default function App() {
     return null;
   });
 
+  // Meta-Progression (Coins, Upgrades, Checkpoints, Achievements)
+  const [meta, setMeta] = useState<MetaProgressionState>(() => {
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY_META);
+      if (raw) {
+        const parsed = JSON.parse(raw) as Partial<MetaProgressionState>;
+        return {
+          ...DEFAULT_META_PROGRESSION,
+          ...parsed,
+          upgradeLevels: {
+            ...DEFAULT_META_PROGRESSION.upgradeLevels,
+            ...(parsed.upgradeLevels || {}),
+          },
+          unlockedCheckpoints:
+            Array.isArray(parsed.unlockedCheckpoints) &&
+            parsed.unlockedCheckpoints.length > 0
+              ? parsed.unlockedCheckpoints
+              : [1],
+          unlockedAchievements: Array.isArray(parsed.unlockedAchievements)
+            ? parsed.unlockedAchievements
+            : [],
+          stats: {
+            ...DEFAULT_META_PROGRESSION.stats,
+            ...(parsed.stats || {}),
+          },
+        };
+      }
+    } catch {
+      // ignore
+    }
+    return DEFAULT_META_PROGRESSION;
+  });
+
+  const [achievementToast, setAchievementToast] =
+    useState<AchievementDef | null>(null);
+  const toastTimeoutRef = useRef<number | null>(null);
+
+  const persistMeta = useCallback((next: MetaProgressionState) => {
+    try {
+      localStorage.setItem(STORAGE_KEY_META, JSON.stringify(next));
+    } catch {
+      // ignore
+    }
+  }, []);
+
+  const triggerAchievementToast = useCallback((ach: AchievementDef) => {
+    setAchievementToast(ach);
+    if (toastTimeoutRef.current) {
+      window.clearTimeout(toastTimeoutRef.current);
+    }
+    toastTimeoutRef.current = window.setTimeout(() => {
+      setAchievementToast(null);
+    }, 4500);
+  }, []);
+
+  const handleMetaEvent = useCallback(
+    (event: MetaGameplayEvent) => {
+      setMeta((prev) => {
+        const addedCoins = event.coinsAdded || 0;
+        let nextCoins = prev.coins + addedCoins;
+        let nextTotalCoins = prev.totalCoinsEarned + Math.max(0, addedCoins);
+
+        const nextStats = {
+          totalKills: prev.stats.totalKills + (event.killsAdded || 0),
+          totalPropsSmashed:
+            prev.stats.totalPropsSmashed + (event.propsSmashedAdded || 0),
+          berserkKills:
+            prev.stats.berserkKills + (event.berserkKillsAdded || 0),
+          bossesKilled:
+            prev.stats.bossesKilled + (event.bossesKilledAdded || 0),
+          grandBossesKilled:
+            prev.stats.grandBossesKilled + (event.grandBossesKilledAdded || 0),
+          highestStageCleared: Math.max(
+            prev.stats.highestStageCleared,
+            event.stageCleared || 0
+          ),
+          maxLevelReached: Math.max(
+            prev.stats.maxLevelReached,
+            event.levelReached || 1
+          ),
+        };
+
+        const nextCheckpoints = [...prev.unlockedCheckpoints];
+        let nextSelectedStage = prev.selectedCheckpoint;
+        if (event.stageCleared && event.stageCleared % 10 === 0) {
+          const unlockedStage = event.stageCleared + 1;
+          if (!nextCheckpoints.includes(unlockedStage)) {
+            nextCheckpoints.push(unlockedStage);
+            nextCheckpoints.sort((a, b) => a - b);
+            nextSelectedStage = unlockedStage;
+          }
+        }
+
+        const nextUnlockedAch = [...prev.unlockedAchievements];
+        let newlyUnlocked: AchievementDef | null = null;
+        for (const ach of ACHIEVEMENTS_LIST) {
+          if (!nextUnlockedAch.includes(ach.id)) {
+            const currentVal =
+              ach.statKey === 'totalCoinsEarned'
+                ? nextTotalCoins
+                : nextStats[ach.statKey];
+            if (currentVal >= ach.targetValue) {
+              nextUnlockedAch.push(ach.id);
+              nextCoins += ach.coinReward;
+              nextTotalCoins += ach.coinReward;
+              newlyUnlocked = ach;
+            }
+          }
+        }
+
+        const nextState: MetaProgressionState = {
+          ...prev,
+          coins: nextCoins,
+          totalCoinsEarned: nextTotalCoins,
+          unlockedCheckpoints: nextCheckpoints,
+          selectedCheckpoint: nextSelectedStage,
+          unlockedAchievements: nextUnlockedAch,
+          selectedTitleAchievementId:
+            prev.selectedTitleAchievementId ||
+            (newlyUnlocked ? newlyUnlocked.id : prev.selectedTitleAchievementId),
+          stats: nextStats,
+        };
+
+        persistMeta(nextState);
+        if (newlyUnlocked) {
+          soundEngine.playLevelUp();
+          setTimeout(() => triggerAchievementToast(newlyUnlocked!), 0);
+        }
+        return nextState;
+      });
+    },
+    [persistMeta, triggerAchievementToast]
+  );
+
+  const handleBuyUpgrade = (upgradeId: MetaUpgradeId) => {
+    const def = META_UPGRADES.find((u) => u.id === upgradeId);
+    if (!def) return;
+    const curLvl = meta.upgradeLevels[upgradeId] || 0;
+    if (curLvl >= def.maxLevel) return;
+    const cost = getMetaUpgradeCost(def, curLvl);
+    if (meta.coins < cost) return;
+
+    soundEngine.playPickup(true);
+    setMeta((prev) => {
+      const nextCoins = prev.coins - cost;
+      const nextState: MetaProgressionState = {
+        ...prev,
+        coins: nextCoins,
+        upgradeLevels: {
+          ...prev.upgradeLevels,
+          [upgradeId]: curLvl + 1,
+        },
+      };
+      persistMeta(nextState);
+      return nextState;
+    });
+  };
+
+  const handleSelectCheckpoint = (stage: number) => {
+    if (!meta.unlockedCheckpoints.includes(stage)) return;
+    soundEngine.playPickup(false);
+    setMeta((prev) => {
+      const next = { ...prev, selectedCheckpoint: stage };
+      persistMeta(next);
+      return next;
+    });
+  };
+
+  const handleSelectTitle = (achId: string) => {
+    if (!meta.unlockedAchievements.includes(achId)) return;
+    soundEngine.playPickup(false);
+    setMeta((prev) => {
+      const next = {
+        ...prev,
+        selectedTitleAchievementId:
+          prev.selectedTitleAchievementId === achId ? null : achId,
+      };
+      persistMeta(next);
+      return next;
+    });
+  };
+
   // Floating 360° Touch Joystick State
   const [joystick, setJoystick] = useState<TouchJoystickState | null>(null);
   const joystickRef = useRef<TouchJoystickState | null>(null);
 
   const actionsRef = useRef<{
-    startNewGame: () => void;
+    startNewGame: (startStage?: number) => void;
     resumeSavedGame: (saved: SavedRunState) => void;
     selectPerk: (perkId: string) => void;
     togglePause: () => void;
@@ -581,6 +777,9 @@ export default function App() {
   const lightningCadence = getChainLightningCadence(
     hud.perkLevels['chain_lightning'] || 0
   );
+  const equippedTitleAch = ACHIEVEMENTS_LIST.find(
+    (a) => a.id === meta.selectedTitleAchievementId
+  );
 
   return (
     <div className="relative w-screen h-screen overflow-hidden select-none touch-none">
@@ -590,12 +789,37 @@ export default function App() {
         phase={hud.phase}
         autoAttack={autoAttack}
         autoPickup={autoPickup}
+        metaProgression={meta}
         onHudUpdate={setHud}
         onSaveRun={handleSaveRun}
+        onMetaEvent={handleMetaEvent}
         registerActions={(acts) => {
           actionsRef.current = acts;
         }}
       />
+
+      {/* Floating Achievement Unlocked Toast Banner */}
+      {achievementToast && (
+        <div className="fixed top-3 left-1/2 -translate-x-1/2 z-50 pointer-events-none animate-fade-in">
+          <div
+            className="bg-slate-950/95 border-2 rounded-2xl px-4 py-2.5 shadow-2xl flex items-center gap-3"
+            style={{
+              borderColor: achievementToast.frameColor,
+              boxShadow: `0 0 28px -4px ${achievementToast.frameColor}`,
+            }}
+          >
+            <div className="text-2xl">{achievementToast.icon}</div>
+            <div>
+              <div className="text-[10px] font-extrabold uppercase tracking-wider text-amber-400">
+                🏆 Достижение открыто! +{achievementToast.coinReward} 🪙
+              </div>
+              <div className="text-xs sm:text-sm font-display font-bold text-white">
+                {achievementToast.title} · Титул «{achievementToast.rewardTitle}»
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Full-Screen 360° Touch Drag Steering Surface (Active during Gameplay) */}
       {hud.phase === 'playing' && (
@@ -710,6 +934,15 @@ export default function App() {
                 </button>
               )}
 
+              <div className="pointer-events-auto bg-slate-950/88 border border-amber-400/45 rounded-xl px-2.5 py-1 sm:px-3.5 sm:py-1.5 text-right shadow-lg">
+                <div className="text-[9px] sm:text-[11px] text-amber-300/90 font-semibold">
+                  Казна
+                </div>
+                <div className="text-xs sm:text-base font-bold text-amber-400 font-mono-tabular">
+                  🪙 {meta.coins.toLocaleString('ru-RU')}
+                </div>
+              </div>
+
               {bestScore > 0 && (
                 <div className="pointer-events-auto bg-slate-950/80 border border-white/10 rounded-xl px-2.5 py-1 sm:px-3.5 sm:py-1.5 text-right">
                   <div className="text-[9px] sm:text-[11px] text-slate-400">Рекорд</div>
@@ -721,22 +954,47 @@ export default function App() {
             </div>
           </div>
 
-          {/* Compact & Collapsible Bottom Character Forge Sheet (Leaves Full 3D Hero Visible Above!) */}
-          <div className="pointer-events-auto w-full max-w-md self-center sm:self-start bg-slate-950/82 border border-white/12 rounded-2xl p-2.5 sm:p-3.5 shadow-2xl space-y-2">
-            {/* Compact Header Row: Hero Name + Sound + Minimize Toggle */}
+          {/* Compact & Collapsible Bottom Character Forge & Meta Shop Sheet */}
+          <div
+            className="pointer-events-auto w-full max-w-lg self-center sm:self-start bg-slate-950/86 border rounded-2xl p-2.5 sm:p-3.5 shadow-2xl space-y-2"
+            style={{
+              borderColor: equippedTitleAch
+                ? equippedTitleAch.frameColor
+                : 'rgba(255,255,255,0.14)',
+              boxShadow: equippedTitleAch
+                ? `0 0 24px -8px ${equippedTitleAch.frameColor}`
+                : undefined,
+            }}
+          >
+            {/* Compact Header Row: Hero Name + Equipped Title Badge + Sound + Minimize Toggle */}
             <div className="flex items-center justify-between gap-2">
               <div className="min-w-0 flex-1">
-                <div className="flex items-center gap-1.5">
+                <div className="flex items-center gap-1.5 flex-wrap">
                   <h2 className="text-sm sm:text-base font-bold text-white tracking-tight truncate">
                     {appearance.name}
                   </h2>
-                  <span className="text-[10px] text-slate-400 truncate hidden sm:inline">
-                    · {appearance.tagline}
-                  </span>
+                  {equippedTitleAch ? (
+                    <span
+                      className="px-2 py-0.5 rounded-md text-[10px] font-extrabold uppercase tracking-wider bg-slate-900 border"
+                      style={{
+                        color: equippedTitleAch.frameColor,
+                        borderColor: equippedTitleAch.frameColor,
+                      }}
+                    >
+                      {equippedTitleAch.icon} {equippedTitleAch.rewardTitle}
+                    </span>
+                  ) : (
+                    <span className="text-[10px] text-slate-400 truncate hidden sm:inline">
+                      · {appearance.tagline}
+                    </span>
+                  )}
                 </div>
               </div>
 
               <div className="flex items-center gap-1.5 shrink-0">
+                <span className="px-2 py-1 rounded-lg bg-amber-500/15 border border-amber-400/35 text-[11px] font-mono-tabular font-bold text-amber-300">
+                  🪙 {meta.coins}
+                </span>
                 <button
                   type="button"
                   onClick={handleToggleMute}
@@ -749,19 +1007,41 @@ export default function App() {
                   onClick={() => setTitleMinimized((prev) => !prev)}
                   className="px-2.5 py-1 text-[10px] sm:text-xs font-semibold text-amber-300 bg-slate-900/90 hover:bg-slate-800 border border-white/10 rounded-lg transition-colors"
                 >
-                  {titleMinimized ? '▴ Настроить героя' : '▾ Свернуть'}
+                  {titleMinimized ? '▴ Лавка и герой' : '▾ Свернуть'}
                 </button>
               </div>
             </div>
 
             {!titleMinimized && (
               <>
-                {/* Compact 3-Tab Switcher so the card stays low-height */}
-                <div className="grid grid-cols-3 gap-1 bg-slate-900/90 p-1 rounded-xl border border-white/8">
+                {/* Compact 5-Tab Switcher: Upgrades, Achievements, AI, Parts, Presets */}
+                <div className="grid grid-cols-5 gap-1 bg-slate-900/90 p-1 rounded-xl border border-white/8">
+                  <button
+                    type="button"
+                    onClick={() => setTitleTab('upgrades')}
+                    className={`py-1 px-1.5 rounded-lg text-[10px] sm:text-[11px] font-semibold transition-colors truncate ${
+                      titleTab === 'upgrades'
+                        ? 'bg-amber-500 text-slate-950 font-bold'
+                        : 'text-slate-300 hover:text-white'
+                    }`}
+                  >
+                    🪙 Прокачка
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setTitleTab('achievements')}
+                    className={`py-1 px-1.5 rounded-lg text-[10px] sm:text-[11px] font-semibold transition-colors truncate ${
+                      titleTab === 'achievements'
+                        ? 'bg-amber-500 text-slate-950 font-bold'
+                        : 'text-slate-300 hover:text-white'
+                    }`}
+                  >
+                    🏆 Ачивки ({meta.unlockedAchievements.length}/{ACHIEVEMENTS_LIST.length})
+                  </button>
                   <button
                     type="button"
                     onClick={() => setTitleTab('ai')}
-                    className={`py-1 px-2 rounded-lg text-[11px] font-semibold transition-colors ${
+                    className={`py-1 px-1.5 rounded-lg text-[10px] sm:text-[11px] font-semibold transition-colors truncate ${
                       titleTab === 'ai'
                         ? 'bg-amber-500 text-slate-950 font-bold'
                         : 'text-slate-300 hover:text-white'
@@ -772,18 +1052,18 @@ export default function App() {
                   <button
                     type="button"
                     onClick={() => setTitleTab('parts')}
-                    className={`py-1 px-2 rounded-lg text-[11px] font-semibold transition-colors ${
+                    className={`py-1 px-1.5 rounded-lg text-[10px] sm:text-[11px] font-semibold transition-colors truncate ${
                       titleTab === 'parts'
                         ? 'bg-amber-500 text-slate-950 font-bold'
                         : 'text-slate-300 hover:text-white'
                     }`}
                   >
-                    🦊 Уши и Хвост
+                    🦊 Детали
                   </button>
                   <button
                     type="button"
                     onClick={() => setTitleTab('presets')}
-                    className={`py-1 px-2 rounded-lg text-[11px] font-semibold transition-colors ${
+                    className={`py-1 px-1.5 rounded-lg text-[10px] sm:text-[11px] font-semibold transition-colors truncate ${
                       titleTab === 'presets'
                         ? 'bg-amber-500 text-slate-950 font-bold'
                         : 'text-slate-300 hover:text-white'
@@ -792,6 +1072,132 @@ export default function App() {
                     🎭 Образы
                   </button>
                 </div>
+
+                {/* TAB: UPGRADES SHOP (10 Permanent Meta-Upgrades) */}
+                {titleTab === 'upgrades' && (
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-1.5 max-h-44 overflow-y-auto pr-0.5">
+                    {META_UPGRADES.map((upg) => {
+                      const lvl = meta.upgradeLevels[upg.id] || 0;
+                      const isMax = lvl >= upg.maxLevel;
+                      const cost = getMetaUpgradeCost(upg, lvl);
+                      const canAfford = !isMax && meta.coins >= cost;
+                      return (
+                        <div
+                          key={upg.id}
+                          className="flex items-center justify-between gap-2 bg-slate-900/90 border border-white/10 rounded-xl px-2.5 py-1.5"
+                        >
+                          <div className="min-w-0 flex-1">
+                            <div className="flex items-center gap-1.5">
+                              <span className="text-sm">{upg.icon}</span>
+                              <span className="text-[11px] font-bold text-white truncate">
+                                {upg.title}
+                              </span>
+                              <span
+                                className="text-[9px] font-mono-tabular px-1.5 py-0.2 rounded bg-slate-950 border border-white/10"
+                                style={{ color: upg.color }}
+                              >
+                                {lvl}/{upg.maxLevel}
+                              </span>
+                            </div>
+                            <div className="text-[10px] text-slate-400 truncate">
+                              {upg.perLevelLabel(lvl > 0 ? lvl : 1)}
+                            </div>
+                          </div>
+                          <button
+                            type="button"
+                            disabled={isMax || !canAfford}
+                            onClick={() => handleBuyUpgrade(upg.id)}
+                            className={`px-2.5 py-1 rounded-lg text-[10px] font-mono-tabular font-extrabold shrink-0 transition-colors ${
+                              isMax
+                                ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 cursor-default'
+                                : canAfford
+                                ? 'bg-amber-500 hover:bg-amber-400 text-slate-950 shadow'
+                                : 'bg-slate-800 text-slate-500 border border-white/5 cursor-not-allowed'
+                            }`}
+                          >
+                            {isMax ? 'МАКС' : `🪙 ${cost}`}
+                          </button>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+
+                {/* TAB: ACHIEVEMENTS & HERO TITLES */}
+                {titleTab === 'achievements' && (
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-1.5 max-h-44 overflow-y-auto pr-0.5">
+                    {ACHIEVEMENTS_LIST.map((ach) => {
+                      const unlocked = meta.unlockedAchievements.includes(ach.id);
+                      const curVal =
+                        ach.statKey === 'totalCoinsEarned'
+                          ? meta.totalCoinsEarned
+                          : meta.stats[ach.statKey] || 0;
+                      const progressPct = Math.min(
+                        100,
+                        Math.floor((curVal / ach.targetValue) * 100)
+                      );
+                      const isEquipped = meta.selectedTitleAchievementId === ach.id;
+                      return (
+                        <div
+                          key={ach.id}
+                          className={`flex flex-col justify-between gap-1 rounded-xl px-2.5 py-1.5 border transition-colors ${
+                            unlocked
+                              ? 'bg-slate-900/95 border-amber-400/40'
+                              : 'bg-slate-900/50 border-white/8 opacity-80'
+                          }`}
+                        >
+                          <div className="flex items-start justify-between gap-1.5">
+                            <div className="min-w-0">
+                              <div className="flex items-center gap-1">
+                                <span className="text-sm">{ach.icon}</span>
+                                <span className="text-[11px] font-bold text-white truncate">
+                                  {ach.title}
+                                </span>
+                              </div>
+                              <div className="text-[10px] text-slate-400 leading-tight">
+                                {ach.description}
+                              </div>
+                            </div>
+                            <span className="text-[10px] font-mono-tabular font-bold text-amber-300 shrink-0">
+                              +{ach.coinReward} 🪙
+                            </span>
+                          </div>
+
+                          <div className="flex items-center justify-between gap-2 pt-0.5">
+                            <div className="flex-1 h-1.5 bg-slate-950 rounded-full overflow-hidden">
+                              <div
+                                className="h-full transition-all"
+                                style={{
+                                  width: `${progressPct}%`,
+                                  backgroundColor: ach.frameColor,
+                                }}
+                              />
+                            </div>
+                            {unlocked ? (
+                              <button
+                                type="button"
+                                onClick={() => handleSelectTitle(ach.id)}
+                                className={`px-2 py-0.5 rounded text-[9px] font-extrabold transition-colors ${
+                                  isEquipped
+                                    ? 'bg-amber-400 text-slate-950'
+                                    : 'bg-slate-800 hover:bg-slate-700 text-amber-300 border border-amber-400/30'
+                                }`}
+                              >
+                                {isEquipped
+                                  ? `✓ ${ach.rewardTitle}`
+                                  : `Надеть «${ach.rewardTitle}»`}
+                              </button>
+                            ) : (
+                              <span className="text-[9px] font-mono-tabular text-slate-400">
+                                {curVal}/{ach.targetValue}
+                              </span>
+                            )}
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
 
                 {/* TAB 1: Compact Single-Row AI Generator */}
                 {titleTab === 'ai' && (
@@ -1060,6 +1466,42 @@ export default function App() {
               </>
             )}
 
+            {/* Checkpoint Stage Selector (Stage 1, 11, 21, 31... unlocked by defeating Stage 10/20/30 Grand-Bosses) */}
+            <div className="flex items-center justify-between gap-1.5 bg-slate-900/90 border border-white/10 rounded-xl px-2.5 py-1.5">
+              <div className="text-[10px] sm:text-[11px] text-slate-300 font-semibold">
+                🚩 Чекпоинт старта:
+              </div>
+              <div className="flex items-center gap-1 overflow-x-auto">
+                {[1, 11, 21, 31].map((stg) => {
+                  const unlocked = meta.unlockedCheckpoints.includes(stg);
+                  const selected = meta.selectedCheckpoint === stg;
+                  const coinMult = 1 + Math.floor((stg - 1) / 10) * 0.5;
+                  return (
+                    <button
+                      key={stg}
+                      type="button"
+                      disabled={!unlocked}
+                      onClick={() => handleSelectCheckpoint(stg)}
+                      title={
+                        unlocked
+                          ? `Старт с Этапа ${stg} (множитель монет ×${coinMult.toFixed(1)})`
+                          : `Победите Гранд-Босса ${stg - 1}-го этапа, чтобы открыть чекпоинт`
+                      }
+                      className={`px-2 py-0.5 rounded-lg text-[10px] font-mono-tabular font-bold transition-colors ${
+                        selected
+                          ? 'bg-amber-500 text-slate-950 shadow'
+                          : unlocked
+                          ? 'bg-slate-800 hover:bg-slate-700 text-amber-300 border border-amber-400/30'
+                          : 'bg-slate-950/80 text-slate-600 border border-white/5 cursor-not-allowed'
+                      }`}
+                    >
+                      {unlocked ? `Эт.${stg}` : `🔒${stg}`}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+
             {/* Primary CTA Row: Resume Saved Run (if available) + Start New Run */}
             <div className="flex flex-col sm:flex-row gap-1.5 pt-0.5">
               {savedRun && (
@@ -1075,11 +1517,15 @@ export default function App() {
                 type="button"
                 onClick={() => {
                   handleSaveRun(null);
-                  actionsRef.current?.startNewGame();
+                  actionsRef.current?.startNewGame(meta.selectedCheckpoint);
                 }}
                 className="flex-1 py-2.5 px-4 rounded-xl bg-amber-500 hover:bg-amber-400 active:bg-amber-600 text-slate-950 font-display font-extrabold text-xs sm:text-sm tracking-wide shadow-lg transition-transform active:scale-[0.99]"
               >
-                {savedRun ? 'Новый забег' : 'Начать забег'}
+                {savedRun
+                  ? `Новый забег (Эт.${meta.selectedCheckpoint})`
+                  : meta.selectedCheckpoint > 1
+                  ? `В бой с Этапа ${meta.selectedCheckpoint}`
+                  : 'Начать забег'}
               </button>
             </div>
           </div>
@@ -1093,20 +1539,35 @@ export default function App() {
           <div className="w-full flex flex-col gap-1.5">
             <div className="flex items-center justify-between gap-2">
               {/* Top-Left: Ultra-Compact HP + XP + Stage Pill */}
-              <div className="pointer-events-auto bg-slate-950/82 border border-white/12 rounded-xl px-2.5 py-1.5 sm:px-3.5 sm:py-2 flex-1 max-w-[235px] sm:max-w-[300px] space-y-1">
+              <div
+                className={`pointer-events-auto bg-slate-950/82 border rounded-xl px-2.5 py-1.5 sm:px-3.5 sm:py-2 flex-1 max-w-[235px] sm:max-w-[300px] space-y-1 transition-colors ${
+                  hud.isBerserk
+                    ? 'border-rose-500 shadow-[0_0_16px_rgba(244,63,94,0.45)]'
+                    : 'border-white/12'
+                }`}
+              >
                 <div className="flex items-center justify-between gap-2 text-[11px] sm:text-xs font-mono-tabular">
                   <span className="font-bold text-white truncate">
                     Ур.{hud.level} · Эт.{hud.stageNumber}
                   </span>
-                  <span className="font-bold text-emerald-400 shrink-0">
-                    ♥ {hud.hp}/{hud.maxHp}
+                  <span
+                    className={`font-bold shrink-0 ${
+                      hud.isBerserk
+                        ? 'text-rose-400 animate-pulse'
+                        : 'text-emerald-400'
+                    }`}
+                  >
+                    {hud.isBerserk ? '🔥 БЕРСЕРК ' : '♥ '}
+                    {hud.hp}/{hud.maxHp}
                   </span>
                 </div>
 
                 {/* Compact Health Bar */}
                 <div className="w-full h-2 bg-slate-900 rounded-full overflow-hidden border border-white/10">
                   <div
-                    className="h-full bg-emerald-500 transition-transform duration-150 origin-left"
+                    className={`h-full transition-transform duration-150 origin-left ${
+                      hud.isBerserk ? 'bg-rose-500' : 'bg-emerald-500'
+                    }`}
                     style={{ transform: `scaleX(${hpPercent / 100})` }}
                   />
                 </div>
@@ -1142,13 +1603,17 @@ export default function App() {
                 )}
               </div>
 
-              {/* Top-Right: Compact Score + Lightning Proc + Pause Button */}
+              {/* Top-Right: Compact Score + Coins + Lightning Proc + Pause Button */}
               <div className="pointer-events-auto bg-slate-950/82 border border-white/12 rounded-xl px-2.5 py-1.5 sm:px-3.5 sm:py-2 flex items-center gap-2 sm:gap-3 shrink-0">
                 <div className="text-right font-mono-tabular leading-tight">
-                  <div className="text-xs sm:text-sm font-bold text-amber-400">
-                    {hud.score.toLocaleString('ru-RU')}
-                    <span className="text-[10px] text-slate-400 font-normal ml-1">
-                      очк
+                  <div className="text-xs sm:text-sm font-bold text-amber-400 flex items-center justify-end gap-2">
+                    <span>🪙 {meta.coins}</span>
+                    <span className="text-slate-500">·</span>
+                    <span>
+                      {hud.score.toLocaleString('ru-RU')}
+                      <span className="text-[10px] text-slate-400 font-normal ml-0.5">
+                        очк
+                      </span>
                     </span>
                   </div>
                   <div className="text-[10px] sm:text-[11px] font-semibold text-sky-400">
@@ -1168,18 +1633,55 @@ export default function App() {
               </div>
             </div>
 
+            {/* Berserk Active Banner (< 20% HP) */}
+            {hud.isBerserk && hud.deathTimer <= 0 && (
+              <div className="self-center pointer-events-none bg-rose-600/95 text-white font-display font-extrabold text-[11px] sm:text-xs px-3.5 py-1 rounded-lg shadow-lg border border-rose-300 tracking-wide text-center animate-pulse">
+                🔥 РЕЖИМ БЕРСЕРКА · +50% УРОН И СКОРОСТЬ!
+              </div>
+            )}
+
+            {/* GTA-Style "ПОТРАЧЕНО" Death Overlay (while monsters kick character for 5s) */}
+            {hud.deathTimer > 0 && (
+              <div className="fixed inset-x-0 top-[14%] sm:top-[16%] z-30 pointer-events-none flex flex-col items-center justify-center animate-fade-in">
+                <div className="w-full bg-gradient-to-r from-black/40 via-black/88 to-black/40 border-y-2 border-red-600/80 py-2.5 sm:py-4 flex flex-col items-center justify-center shadow-[0_0_50px_rgba(0,0,0,0.95)]">
+                  <div
+                    className="font-display font-black text-4xl sm:text-6xl tracking-[0.16em] text-red-600 uppercase select-none"
+                    style={{
+                      textShadow:
+                        '0 4px 0 #000, -2px -2px 0 #000, 2px -2px 0 #000, -2px 2px 0 #000, 2px 2px 0 #000, 0 0 28px rgba(220,38,38,0.85)',
+                    }}
+                  >
+                    ПОТРАЧЕНО
+                  </div>
+                </div>
+              </div>
+            )}
+
             {/* Slim Stage Announcement OR Active Boss Bar (Compact height so field stays visible) */}
-            {hud.stageAnnouncement && (
+            {hud.stageAnnouncement && hud.deathTimer <= 0 && (
               <div className="self-center pointer-events-none bg-amber-500/95 text-slate-950 font-display font-extrabold text-[11px] sm:text-xs px-3.5 py-1 rounded-lg shadow-lg border border-amber-300 tracking-wide text-center">
                 {hud.stageAnnouncement}
               </div>
             )}
 
             {hud.activeBoss ? (
-              <div className="self-center w-full max-w-md pointer-events-auto bg-slate-950/88 border border-rose-500/50 rounded-xl px-3 py-1.5">
+              <div
+                className={`self-center w-full max-w-md pointer-events-auto bg-slate-950/90 border rounded-xl px-3 py-1.5 ${
+                  hud.activeBoss.isGrandBoss
+                    ? 'border-amber-400 shadow-[0_0_24px_rgba(251,191,36,0.45)]'
+                    : 'border-rose-500/50'
+                }`}
+              >
                 <div className="flex items-center justify-between gap-2 text-[11px] sm:text-xs mb-1">
-                  <span className="font-display font-bold text-rose-400 truncate">
-                    БОСС: {hud.activeBoss.name}
+                  <span
+                    className={`font-display font-bold truncate ${
+                      hud.activeBoss.isGrandBoss
+                        ? 'text-amber-300'
+                        : 'text-rose-400'
+                    }`}
+                  >
+                    {hud.activeBoss.isGrandBoss ? '👑 ГРАНД-БОСС: ' : 'БОСС: '}
+                    {hud.activeBoss.name}
                   </span>
                   <span className="font-mono-tabular text-amber-300 font-semibold shrink-0">
                     {hud.activeBoss.phaseLabel} · {hud.activeBoss.hp} HP
@@ -1270,20 +1772,21 @@ export default function App() {
                     </div>
                   )}
 
-                  {/* Active Cumulative Skills Mini-Row */}
+                  {/* Active Cumulative Skills Mini-Row with Custom SVG Icons */}
                   {Object.keys(hud.perkLevels).length > 0 && (
-                    <div className="pt-1 border-t border-white/10 flex flex-wrap gap-1.5 text-[10px]">
+                    <div className="pt-1.5 border-t border-white/10 flex flex-wrap items-center gap-1.5 text-[10px]">
                       {Object.entries(hud.perkLevels).map(([id, lvl]) => {
                         const pInfo = PERK_POOL.find((p) => p.id === id);
                         if (!pInfo) return null;
                         return (
                           <span
                             key={id}
-                            className="font-semibold"
+                            className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-lg bg-slate-900/90 border border-white/10 font-mono-tabular font-bold"
                             style={{ color: pInfo.color }}
                             title={pInfo.title}
                           >
-                            {pInfo.icon}×{lvl}
+                            <SkillIcon id={id} className="w-4 h-4 shrink-0" />
+                            <span>×{lvl}</span>
                           </span>
                         );
                       })}
@@ -1398,7 +1901,7 @@ export default function App() {
       {/* ==================== 3. COMPACT 3-ICON LEVEL-UP SELECTOR (NO SCREEN BLOCKING) ==================== */}
       {hud.phase === 'levelup' && (
         <div className="fixed inset-0 z-20 pointer-events-none flex flex-col items-center justify-center p-3">
-          <div className="pointer-events-auto flex flex-col items-center gap-2.5 bg-slate-950/78 backdrop-blur-md border border-amber-400/40 rounded-2xl px-4 py-3 shadow-2xl">
+          <div className="pointer-events-auto flex flex-col items-center gap-2.5 bg-slate-950/82 backdrop-blur-md border border-amber-400/45 rounded-2xl px-4 py-3.5 shadow-2xl">
             <div className="text-xs sm:text-sm font-display font-extrabold text-amber-300 tracking-wide">
               УРОВЕНЬ {hud.level} — ВЫБЕРИ НАВЫК
             </div>
@@ -1412,20 +1915,24 @@ export default function App() {
                     key={perk.id}
                     type="button"
                     onClick={() => actionsRef.current?.selectPerk(perk.id)}
-                    className="w-22 h-24 sm:w-26 sm:h-28 rounded-2xl bg-slate-900/95 hover:bg-slate-800 active:scale-95 border-2 flex flex-col items-center justify-center gap-1 p-1.5 shadow-xl transition-transform group"
+                    className="w-24 h-28 sm:w-28 sm:h-32 rounded-2xl bg-slate-900/95 hover:bg-slate-800 active:scale-95 border-2 flex flex-col items-center justify-between py-2 px-1.5 shadow-xl transition-transform group"
                     style={{
                       borderColor: perk.color,
+                      boxShadow: `0 0 22px -6px ${perk.color}`,
                     }}
                     title={perk.title}
                   >
-                    <span className="text-3xl sm:text-4xl leading-none select-none group-hover:scale-110 transition-transform">
-                      {perk.icon}
-                    </span>
+                    <div className="group-hover:scale-110 transition-transform duration-150">
+                      <SkillIcon
+                        id={perk.id}
+                        className="w-12 h-12 sm:w-14 sm:h-14"
+                      />
+                    </div>
                     <span className="text-[11px] sm:text-xs font-extrabold text-white truncate max-w-full leading-tight">
                       {perk.shortTitle}
                     </span>
                     <span
-                      className="text-[10px] font-mono-tabular font-bold px-1.5 py-0.5 rounded bg-slate-950/90"
+                      className="text-[10px] font-mono-tabular font-bold px-2 py-0.5 rounded-md bg-slate-950/90 border border-white/10"
                       style={{ color: perk.color }}
                     >
                       {curLvl > 0 ? `Ур.${curLvl}→${nextLvl}` : 'Ур.1'}
@@ -1486,10 +1993,12 @@ export default function App() {
               </button>
               <button
                 type="button"
-                onClick={() => actionsRef.current?.startNewGame()}
+                onClick={() =>
+                  actionsRef.current?.startNewGame(meta.selectedCheckpoint)
+                }
                 className="w-full py-2.5 px-4 rounded-xl bg-slate-800 hover:bg-slate-700 text-white font-semibold text-xs transition-colors"
               >
-                Начать заново
+                Начать заново (Эт.{meta.selectedCheckpoint})
               </button>
               <button
                 type="button"
@@ -1498,7 +2007,7 @@ export default function App() {
                 }
                 className="w-full py-2.5 px-4 rounded-xl bg-slate-950 hover:bg-slate-800 border border-white/10 text-slate-300 font-medium text-xs transition-colors"
               >
-                Сохранить и выйти в меню
+                Сохранить и выйти в меню (Прокачка 🪙)
               </button>
             </div>
           </div>
@@ -1517,7 +2026,7 @@ export default function App() {
                 {appearance.name} пал в бою
               </h2>
               <p className="text-xs text-slate-400">
-                Локация: {currentBiome.name}
+                Локация: {currentBiome.name} · Этап {hud.stageNumber}
               </p>
             </div>
 
@@ -1528,10 +2037,10 @@ export default function App() {
                   {hud.score.toLocaleString('ru-RU')}
                 </div>
               </div>
-              <div className="bg-slate-950 border border-white/10 rounded-xl p-3">
-                <div className="text-[11px] text-slate-400">Время выживания</div>
-                <div className="text-lg sm:text-xl font-bold text-white">
-                  {formatTime(hud.elapsedTime)}
+              <div className="bg-slate-950 border border-amber-400/30 rounded-xl p-3">
+                <div className="text-[11px] text-amber-300">Добыто монет</div>
+                <div className="text-lg sm:text-xl font-bold text-amber-400">
+                  +{hud.runCoins} 🪙 (Всего: {meta.coins})
                 </div>
               </div>
               <div className="bg-slate-950 border border-white/10 rounded-xl p-3">
@@ -1551,19 +2060,23 @@ export default function App() {
             <div className="flex flex-col sm:flex-row gap-2.5">
               <button
                 type="button"
-                onClick={() => actionsRef.current?.startNewGame()}
+                onClick={() =>
+                  actionsRef.current?.startNewGame(meta.selectedCheckpoint)
+                }
                 className="flex-1 py-3 px-5 rounded-xl bg-amber-500 hover:bg-amber-400 text-slate-950 font-display font-extrabold text-sm transition-colors"
               >
-                Новый забег
+                Новый забег (Эт.{meta.selectedCheckpoint})
               </button>
               <button
                 type="button"
-                onClick={() =>
-                  setHud((prev) => ({ ...prev, phase: 'title' }))
-                }
-                className="py-3 px-5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 font-semibold text-xs transition-colors"
+                onClick={() => {
+                  setTitleTab('upgrades');
+                  setTitleMinimized(false);
+                  setHud((prev) => ({ ...prev, phase: 'title' }));
+                }}
+                className="py-3 px-5 rounded-xl bg-slate-800 hover:bg-slate-700 text-amber-300 border border-amber-400/30 font-bold text-xs transition-colors"
               >
-                В кузницу персонажа
+                🪙 В лавку прокачки ({meta.coins})
               </button>
             </div>
           </div>
